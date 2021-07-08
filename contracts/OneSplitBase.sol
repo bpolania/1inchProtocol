@@ -79,6 +79,7 @@ contract OneSplitRoot is IOneSplitView {
     using UniversalERC20 for IWETH;
     using UniswapV2ExchangeLib for IUniswapV2Exchange;
     using ChaiHelper for IChai;
+    using SushswapV2ExchangeLib for ISushiswapV2Exchange;
 
     uint256 constant internal DEXES_COUNT = 34;
     IERC20 constant internal ETH_ADDRESS = IERC20(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);
@@ -133,6 +134,9 @@ contract OneSplitRoot is IOneSplitView {
     ICompoundRegistry constant internal compoundRegistry = ICompoundRegistry(0xF451Dbd7Ba14BFa7B1B78A766D3Ed438F79EE1D1);
     IAaveRegistry constant internal aaveRegistry = IAaveRegistry(0xEd8b133B7B88366E01Bb9E38305Ab11c26521494);
     IBalancerHelper constant internal balancerHelper = IBalancerHelper(0xA961672E8Db773be387e775bc4937C678F3ddF9a);
+    
+    // Sushiswap's Uniswap Factory
+    ISushiV2Factory constant internal sushiV2 = ISushiV2Factory(0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac);
 
     int256 internal constant VERY_NEGATIVE_VALUE = -1e72;
 
@@ -479,7 +483,12 @@ contract OneSplitView is IOneSplitView, OneSplitRoot {
             true,  // "Kyber 4"
             true,  // "Mooniswap 2"
             true,  // "Mooniswap 3"
-            true   // "Mooniswap 4"
+            true,  // "Mooniswap 4"
+            true,  // "Sushiswap V2 (ETH)",
+            true,  // "Sushiswap V2 (USDC)",
+            true,  // "Viper (ETH)",
+            true   // "Viper (USDC)",
+
         ];
 
         for (uint i = 0; i < DEXES_COUNT; i++) {
@@ -541,7 +550,9 @@ contract OneSplitView is IOneSplitView, OneSplitRoot {
             invert != flags.check(FLAG_DISABLE_KYBER_ALL | FLAG_DISABLE_KYBER_4)              ? _calculateNoReturn : calculateKyber4,
             invert != flags.check(FLAG_DISABLE_MOONISWAP_ALL | FLAG_DISABLE_MOONISWAP_ETH)    ? _calculateNoReturn : calculateMooniswapOverETH,
             invert != flags.check(FLAG_DISABLE_MOONISWAP_ALL | FLAG_DISABLE_MOONISWAP_DAI)    ? _calculateNoReturn : calculateMooniswapOverDAI,
-            invert != flags.check(FLAG_DISABLE_MOONISWAP_ALL | FLAG_DISABLE_MOONISWAP_USDC)   ? _calculateNoReturn : calculateMooniswapOverUSDC
+            invert != flags.check(FLAG_DISABLE_MOONISWAP_ALL | FLAG_DISABLE_MOONISWAP_USDC)   ? _calculateNoReturn : calculateMooniswapOverUSDC,
+            /// Sushiswap
+            invert != flags.check(FLAG_DISABLE_UNISWAP_V2_ALL | FLAG_DISABLE_UNISWAP_V2)      ? _calculateNoReturn : calculateSushiswapV2
         ];
     }
 
@@ -1696,6 +1707,47 @@ contract OneSplitView is IOneSplitView, OneSplitRoot {
         this;
         return (new uint256[](parts), 0);
     }
+
+    //// HARMONY MEAT
+
+    function calculateSushiswapV2(
+        IERC20 fromToken,
+        IERC20 destToken,
+        uint256 amount,
+        uint256 parts,
+        uint256 flags
+    ) internal view returns(uint256[] memory rets, uint256 gas) {
+        return _calculateSushiswapV2(
+            fromToken,
+            destToken,
+            _linearInterpolation(amount, parts),
+            flags
+        );
+    }
+
+    function _calculateSushiswapV2(
+        IERC20 fromToken,
+        IERC20 destToken,
+        uint256[] memory amounts,
+        uint256 /*flags*/
+    ) internal view returns(uint256[] memory rets, uint256 gas) {
+        rets = new uint256[](amounts.length);
+
+        IERC20 fromTokenReal = fromToken.isETH() ? weth : fromToken;
+        IERC20 destTokenReal = destToken.isETH() ? weth : destToken;
+        ISushiswapV2Exchange exchange = sushiswapV2.getPair(fromTokenReal, destTokenReal);
+        if (exchange != ISushiswapV2Exchange(0)) {
+            uint256 fromTokenBalance = fromTokenReal.universalBalanceOf(address(exchange));
+            uint256 destTokenBalance = destTokenReal.universalBalanceOf(address(exchange));
+            for (uint i = 0; i < amounts.length; i++) {
+                rets[i] = _calculateUniswapFormula(fromTokenBalance, destTokenBalance, amounts[i]);
+            }
+            return (rets, 50_000);
+        }
+    }
+
+    // FIRST MEAT COMPLTE
+
 }
 
 
@@ -1838,7 +1890,8 @@ contract OneSplit is IOneSplit, OneSplitRoot {
             _swapOnKyber4,
             _swapOnMooniswapETH,
             _swapOnMooniswapDAI,
-            _swapOnMooniswapUSDC
+            _swapOnMooniswapUSDC,
+            _swapOnUniswapV2
         ];
 
         require(distribution.length <= reserves.length, "OneSplit: Distribution array should not exceed reserves array size");
@@ -2581,4 +2634,78 @@ contract OneSplit is IOneSplit, OneSplitRoot {
     ) internal {
         _swapOnBalancerX(fromToken, destToken, amount, flags, 2);
     }
+
+    //// More Harmony 
+
+    function _swapOnSushiswapV2Internal(
+        IERC20 fromToken,
+        IERC20 destToken,
+        uint256 amount,
+        uint256 /*flags*/
+    ) internal returns(uint256 returnAmount) {
+        if (fromToken.isETH()) {
+            weth.deposit.value(amount)();
+        }
+
+        IERC20 fromTokenReal = fromToken.isETH() ? weth : fromToken;
+        IERC20 toTokenReal = destToken.isETH() ? weth : destToken;
+        ISushiswapV2Exchange exchange = sushiswapV2.getPair(fromTokenReal, toTokenReal);
+        bool needSync;
+        bool needSkim;
+        (returnAmount, needSync, needSkim) = exchange.getReturn(fromTokenReal, toTokenReal, amount);
+        if (needSync) {
+            exchange.sync();
+        }
+        else if (needSkim) {
+            //TODO
+            exchange.skim(0x68a17B587CAF4f9329f0e372e3A78D23A46De6b5);
+        }
+
+        fromTokenReal.universalTransfer(address(exchange), amount);
+        if (uint256(address(fromTokenReal)) < uint256(address(toTokenReal))) {
+            exchange.swap(0, returnAmount, address(this), "");
+        } else {
+            exchange.swap(returnAmount, 0, address(this), "");
+        }
+
+        if (destToken.isETH()) {
+            weth.withdraw(weth.balanceOf(address(this)));
+        }
+    }
+
+    function _swapOnSushiswapV2OverMid(
+        IERC20 fromToken,
+        IERC20 midToken,
+        IERC20 destToken,
+        uint256 amount,
+        uint256 flags
+    ) internal {
+        _swapOnSushiswapV2Internal(
+            midToken,
+            destToken,
+            _swapOnSushiswapV2Internal(
+                fromToken,
+                midToken,
+                amount,
+                flags
+            ),
+            flags
+        );
+    }
+
+    function _swapOnSushiswapV2(
+        IERC20 fromToken,
+        IERC20 destToken,
+        uint256 amount,
+        uint256 flags
+    ) internal {
+        _swapOnSushiswapV2Internal(
+            fromToken,
+            destToken,
+            amount,
+            flags
+        );
+    }
+
+    /// More old meat end
 }
